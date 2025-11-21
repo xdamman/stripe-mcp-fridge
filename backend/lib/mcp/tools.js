@@ -52,6 +52,7 @@ function convertMCPToolToOpenAI(mcpTool) {
  */
 async function getStripeTools(forceRefresh = false) {
     const now = Date.now();
+    console.log('[Tools] getStripeTools called', { forceRefresh, hasCache: cachedTools !== null });
 
     // Return cached tools if still valid
     if (
@@ -59,18 +60,27 @@ async function getStripeTools(forceRefresh = false) {
         cachedTools !== null &&
         now - cacheTimestamp < CACHE_TTL
     ) {
+        const cacheAge = now - cacheTimestamp;
+        console.log(`[Tools] Using cached tools (age: ${Math.round(cacheAge / 1000)}s)`);
         return cachedTools;
     }
 
+    console.log('[Tools] Fetching tools from MCP server...');
+    const startTime = Date.now();
     try {
         const mcpTools = await listStripeMCPTools();
+        console.log(`[Tools] Received ${mcpTools.length} tools from MCP`);
         cachedTools = mcpTools.map(convertMCPToolToOpenAI);
         cacheTimestamp = now;
+        const elapsed = Date.now() - startTime;
+        console.log(`[Tools] Converted ${cachedTools.length} tools to OpenAI format (${elapsed}ms)`);
         return cachedTools;
     } catch (error) {
+        const elapsed = Date.now() - startTime;
+        console.error(`[Tools] Failed to fetch tools (${elapsed}ms):`, error.message);
         // If fetch fails and we have cached tools, return cache
         if (cachedTools !== null) {
-            console.warn('Failed to fetch tools from MCP, using cache:', error);
+            console.warn('[Tools] Using stale cache due to fetch failure');
             return cachedTools;
         }
         throw error;

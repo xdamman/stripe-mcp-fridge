@@ -7,9 +7,19 @@
 // Load environment variables from .env file if available
 try {
     require('dotenv').config();
+    console.log('[Config] dotenv loaded');
 } catch (e) {
-    // dotenv is optional
+    console.warn('[Config] dotenv not available:', e.message);
 }
+
+// Log environment variable status (without exposing values)
+console.log('[Config] Environment check:', {
+    hasDat1Key: !!process.env.DAT1_API_KEY,
+    hasStripeKey: !!process.env.STRIPE_SECRET_KEY,
+    dat1KeyLength: process.env.DAT1_API_KEY ? process.env.DAT1_API_KEY.length : 0,
+    stripeKeyLength: process.env.STRIPE_SECRET_KEY ? process.env.STRIPE_SECRET_KEY.length : 0,
+    stripeKeyPrefix: process.env.STRIPE_SECRET_KEY ? process.env.STRIPE_SECRET_KEY.substring(0, 7) : 'missing'
+});
 
 const path = require('path');
 const express = require('express');
@@ -69,27 +79,43 @@ function parseSSEChunk(chunk) {
  * Executes a tool call via Stripe MCP
  */
 async function executeToolCall(toolName, toolArguments) {
+    console.log(`[ToolCall] Executing ${toolName}`, {
+        argumentsLength: toolArguments ? toolArguments.length : 0
+    });
+    const startTime = Date.now();
     try {
         let parsedArgs = {};
         
         if (toolArguments) {
-            parsedArgs = JSON.parse(toolArguments);
+            try {
+                parsedArgs = JSON.parse(toolArguments);
+                console.log(`[ToolCall] Parsed arguments for ${toolName}`);
+            } catch (parseError) {
+                console.error(`[ToolCall] Failed to parse arguments for ${toolName}:`, parseError.message);
+                throw new Error(`Invalid tool arguments JSON: ${parseError.message}`);
+            }
         }
 
         const result = await callStripeMCPTool(toolName, parsedArgs);
+        const elapsed = Date.now() - startTime;
+        console.log(`[ToolCall] ${toolName} returned result (${elapsed}ms)`);
         
         // MCP returns result in content array format
         if (result?.content && Array.isArray(result.content)) {
             const textContent = result.content.find((item) => item.type === 'text');
             if (textContent?.text) {
+                console.log(`[ToolCall] Extracted text content from ${toolName} result`);
                 return textContent.text;
             }
         }
 
         // Fallback: stringify the entire result
+        console.log(`[ToolCall] Returning stringified result for ${toolName}`);
         return JSON.stringify(result);
     } catch (error) {
+        const elapsed = Date.now() - startTime;
         const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`[ToolCall] ${toolName} failed (${elapsed}ms):`, errorMessage);
         return JSON.stringify({ error: errorMessage });
     }
 }
@@ -98,7 +124,15 @@ async function executeToolCall(toolName, toolArguments) {
  * Makes a streaming request to dat1 API with tool support
  */
 async function makeDat1Request(messages, tools, temperature, maxTokens) {
+    console.log('[dat1] Making request:', {
+        messageCount: messages.length,
+        toolCount: tools.length,
+        temperature,
+        maxTokens
+    });
+    
     if (!process.env.DAT1_API_KEY) {
+        console.error('[dat1] ERROR: DAT1_API_KEY is not configured');
         throw new Error('DAT1_API_KEY is not configured');
     }
 
@@ -112,16 +146,27 @@ async function makeDat1Request(messages, tools, temperature, maxTokens) {
     // Only include tools if we have any
     if (tools.length > 0) {
         requestBody.tools = tools;
+        console.log(`[dat1] Including ${tools.length} tool(s) in request`);
     }
 
-    return fetch(DAT1_API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': process.env.DAT1_API_KEY,
-        },
-        body: JSON.stringify(requestBody),
-    });
+    const startTime = Date.now();
+    try {
+        const response = await fetch(DAT1_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': process.env.DAT1_API_KEY,
+            },
+            body: JSON.stringify(requestBody),
+        });
+        const elapsed = Date.now() - startTime;
+        console.log(`[dat1] Request completed (${elapsed}ms):`, response.status);
+        return response;
+    } catch (error) {
+        const elapsed = Date.now() - startTime;
+        console.error(`[dat1] Request failed (${elapsed}ms):`, error.message);
+        throw error;
+    }
 }
 
 // ============================================================================
@@ -133,18 +178,26 @@ async function makeDat1Request(messages, tools, temperature, maxTokens) {
  * Streaming chat endpoint with Stripe MCP tool support
  */
 app.post('/api/chat-stream', async (req, res) => {
+    const requestStartTime = Date.now();
     const { messages } = req.body;
+    console.log(`[API] POST /api/chat-stream - ${messages.length} messages`);
 
     if (!process.env.DAT1_API_KEY) {
+        console.error('[API] ERROR: DAT1_API_KEY is not configured');
         return res.status(500).json({ error: 'DAT1_API_KEY is not configured' });
     }
 
     // Get Stripe tools (cached)
     let tools = [];
+    const toolsStartTime = Date.now();
     try {
+        console.log('[API] Fetching Stripe tools...');
         tools = await getStripeTools();
+        const toolsElapsed = Date.now() - toolsStartTime;
+        console.log(`[API] Loaded ${tools.length} Stripe tools (${toolsElapsed}ms)`);
     } catch (error) {
-        console.error('Failed to fetch Stripe tools:', error);
+        const toolsElapsed = Date.now() - toolsStartTime;
+        console.error(`[API] Failed to fetch Stripe tools (${toolsElapsed}ms):`, error.message);
         // Continue without tools if fetch fails
     }
 
@@ -162,9 +215,14 @@ app.post('/api/chat-stream', async (req, res) => {
     try {
         while (iterationCount < MAX_ITERATIONS) {
             iterationCount++;
+            console.log(`[API] Iteration ${iterationCount}/${MAX_ITERATIONS}`);
 
             // Make request to dat1 API
+            console.log(`[API] Making request to dat1 API with ${conversationMessages.length} messages, ${tools.length} tools`);
+            const dat1StartTime = Date.now();
             const response = await makeDat1Request(conversationMessages, tools, temperature, maxTokens);
+            const dat1Elapsed = Date.now() - dat1StartTime;
+            console.log(`[API] dat1 API response received (${dat1Elapsed}ms):`, response.status, response.statusText);
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -265,6 +323,9 @@ app.post('/api/chat-stream', async (req, res) => {
 
             // If we have tool calls, execute them
             if (hasToolCalls && toolCalls.length > 0) {
+                console.log(`[API] Executing ${toolCalls.length} tool call(s):`, 
+                    toolCalls.map(tc => tc.function.name).join(', '));
+                
                 // Add assistant message with tool calls
                 conversationMessages.push({
                     role: 'assistant',
@@ -273,29 +334,48 @@ app.post('/api/chat-stream', async (req, res) => {
                 });
 
                 // Execute all tool calls
+                const toolExecutionStartTime = Date.now();
                 const toolResults = await Promise.all(
-                    toolCalls.map(async (toolCall) => {
-                        const result = await executeToolCall(
-                            toolCall.function.name,
-                            toolCall.function.arguments
-                        );
-
-                        return {
-                            role: 'tool',
-                            content: result,
-                            tool_call_id: toolCall.id,
-                        };
+                    toolCalls.map(async (toolCall, index) => {
+                        const toolStartTime = Date.now();
+                        console.log(`[API] Executing tool ${index + 1}/${toolCalls.length}: ${toolCall.function.name}`);
+                        try {
+                            const result = await executeToolCall(
+                                toolCall.function.name,
+                                toolCall.function.arguments
+                            );
+                            const toolElapsed = Date.now() - toolStartTime;
+                            console.log(`[API] Tool ${toolCall.function.name} completed (${toolElapsed}ms)`);
+                            return {
+                                role: 'tool',
+                                content: result,
+                                tool_call_id: toolCall.id,
+                            };
+                        } catch (error) {
+                            const toolElapsed = Date.now() - toolStartTime;
+                            console.error(`[API] Tool ${toolCall.function.name} failed (${toolElapsed}ms):`, error.message);
+                            return {
+                                role: 'tool',
+                                content: JSON.stringify({ error: error.message }),
+                                tool_call_id: toolCall.id,
+                            };
+                        }
                     })
                 );
+                const toolExecutionElapsed = Date.now() - toolExecutionStartTime;
+                console.log(`[API] All ${toolCalls.length} tool(s) executed (${toolExecutionElapsed}ms)`);
 
                 // Add tool results to messages
                 conversationMessages.push(...toolResults);
 
                 // Continue loop to get final response
+                console.log(`[API] Continuing to next iteration with ${conversationMessages.length} messages`);
                 continue;
             }
 
             // No tool calls, send final data and close
+            const totalElapsed = Date.now() - requestStartTime;
+            console.log(`[API] Request completed successfully (${totalElapsed}ms, ${iterationCount} iteration(s))`);
             if (finalData) {
                 res.write(`data: ${JSON.stringify(finalData)}\n\n`);
             }
@@ -306,10 +386,14 @@ app.post('/api/chat-stream', async (req, res) => {
         }
 
         // Max iterations reached
+        const totalElapsed = Date.now() - requestStartTime;
+        console.warn(`[API] Maximum iterations reached (${totalElapsed}ms)`);
         res.write(`data: ${JSON.stringify({ error: 'Maximum iterations reached' })}\n\n`);
         res.end();
     } catch (error) {
-        console.error('Error in chat-stream:', error);
+        const totalElapsed = Date.now() - requestStartTime;
+        console.error(`[API] Error in chat-stream (${totalElapsed}ms):`, error);
+        console.error('[API] Error stack:', error.stack);
         res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
         res.end();
     }
